@@ -1,0 +1,100 @@
+#use the following is credential is needed:
+#$cred = Get-Credential
+#Invoke-Command -ComputerName $computer -ScriptBlock $remoteScriptBlock -Credential $cred
+
+# Define the path to the computer list file
+$computerListPath = "$PSScriptRoot\computers.txt"
+
+# Check if file exists
+if (-not (Test-Path $computerListPath)) {
+    Write-Host "Computer list file not found: $computerListPath"
+    exit
+}
+
+# Prepare log file
+$timestamp = Get-Date -Format "yyyy-MM-dd_HH-mm-ss"
+$logPath = "$PSScriptRoot\Enable-RDP-NLA_Remote_$timestamp.log"
+
+# Logging function
+function Log {
+    param ($message)
+    $time = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    $entry = "$time - $message"
+    Write-Output $entry
+    Add-Content -Path $logPath -Value $entry
+}
+
+# Script block to run remotely
+$remoteScriptBlock = {
+    $rdpKeyPath = "HKLM:\System\CurrentControlSet\Control\Terminal Server"
+    $rdpKeyName = "fDenyTSConnections"
+    $nlaKeyPath = "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp"
+    $nlaKeyName = "UserAuthentication"
+
+    $result = @{}
+
+    try {
+        # Get current values
+        $currentRDP = Get-ItemProperty -Path $rdpKeyPath -Name $rdpKeyName
+        $currentNLA = Get-ItemProperty -Path $nlaKeyPath -Name $nlaKeyName
+
+        $result["CurrentRDP"] = $currentRDP.$rdpKeyName
+        $result["CurrentNLA"] = $currentNLA.$nlaKeyName
+
+        # Update RDP setting if needed
+        if ($currentRDP.$rdpKeyName -ne 0) {
+            Set-ItemProperty -Path $rdpKeyPath -Name $rdpKeyName -Value 0
+            $result["RDPChanged"] = $true
+        } else {
+            $result["RDPChanged"] = $false
+        }
+
+        # Update NLA setting if needed
+        if ($currentNLA.$nlaKeyName -ne 1) {
+            Set-ItemProperty -Path $nlaKeyPath -Name $nlaKeyName -Value 1
+            $result["NLAChanged"] = $true
+        } else {
+            $result["NLAChanged"] = $false
+        }
+
+        # Confirm new values
+        $newRDP = Get-ItemProperty -Path $rdpKeyPath -Name $rdpKeyName
+        $newNLA = Get-ItemProperty -Path $nlaKeyPath -Name $nlaKeyName
+
+        $result["NewRDP"] = $newRDP.$rdpKeyName
+        $result["NewNLA"] = $newNLA.$nlaKeyName
+        $result["Success"] = $true
+    }
+    catch {
+        $result["Success"] = $false
+        $result["Error"] = $_.Exception.Message
+    }
+
+    return $result
+}
+
+# Loop through each computer
+$computers = Get-Content -Path $computerListPath
+
+foreach ($computer in $computers) {
+    Log "------ Processing $computer ------"
+
+    try {
+        $output = Invoke-Command -ComputerName $computer -ScriptBlock $remoteScriptBlock -ErrorAction Stop
+
+        if ($output.Success) {
+            Log "[$computer] Current RDP: $($output.CurrentRDP), New RDP: $($output.NewRDP), Changed: $($output.RDPChanged)"
+            Log "[$computer] Current NLA: $($output.CurrentNLA), New NLA: $($output.NewNLA), Changed: $($output.NLAChanged)"
+            Log "[$computer] SUCCESS"
+        } else {
+            Log "[$computer] FAILED: $($output.Error)"
+        }
+    }
+    catch {
+        Log "[$computer] ERROR: $($_.Exception.Message)"
+    }
+
+    Log ""
+}
+
+Log "All computers processed. Log saved at: $logPath"
