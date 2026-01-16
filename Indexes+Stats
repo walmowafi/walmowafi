@@ -1,0 +1,548 @@
+/*
+Following script checks statistics update status, provide the following information:
+Table and column names
+Stats type, whether it's for an index or just a column
+Last updated date. (STATS_DATE()).
+Row modification count (how many rows changed since last update). shows how stale the stat is.
+Number of rows sampled vs total rows. Helps identify accuracy of the sample.
+*/
+-- Execute under the context of the database you want to check stats for
+--Use this to prioritize updates for heavily modified or long-unrefreshed stats
+
+SELECT 
+    s.name AS SchemaName,
+    o.name AS TableName,
+    st.name AS StatsName,
+    CASE 
+        WHEN i.name IS NOT NULL THEN 'Index'
+        ELSE 'Column'
+    END AS StatsType,
+    STATS_DATE(st.object_id, st.stats_id) AS LastUpdated,
+    sp.rows AS TotalRows,
+    sp.rows_sampled,
+    sp.modification_counter AS RowsModifiedSinceUpdate
+FROM 
+    sys.stats st
+INNER JOIN 
+    sys.objects o ON st.object_id = o.object_id
+INNER JOIN 
+    sys.schemas s ON o.schema_id = s.schema_id
+LEFT JOIN 
+    sys.indexes i ON st.object_id = i.object_id AND st.name = i.name
+OUTER APPLY 
+    sys.dm_db_stats_properties(st.object_id, st.stats_id) AS sp
+WHERE 
+    o.type = 'U'  -- User tables
+ORDER BY 
+   sp.modification_counter DESC
+   --s.name, o.name, st.name;
+
+
+-------------------------------------------------------------------------------------------------
+/*
+Following script updates only stale statistics, based on:
+Row modification threshold: by default, it updates statistics when >20% of rows have changed
+Applies to both indexed and column statistics
+Can be tuned easily (adjust the threshold if needed)
+
+How It Works:
+Uses sys.dm_db_stats_properties to get modification counts and row counts
+Compares percent modified to the threshold (default: 20%)
+Dynamically builds and runs UPDATE STATISTICS statements only for stale stats
+You can adjust @ThresholdPercent (e.g., to 10 for more aggressive updating).
+*/
+
+DECLARE @ThresholdPercent FLOAT = 20.0;
+
+DECLARE @TableName NVARCHAR(512), @StatsName NVARCHAR(512), @SQL NVARCHAR(MAX);
+
+DECLARE StatsCursor CURSOR FOR
+SELECT 
+    QUOTENAME(SCHEMA_NAME(o.schema_id)) + '.' + QUOTENAME(o.name) AS TableName,
+    st.name AS StatsName,
+    sp.rows,
+    sp.modification_counter
+FROM 
+    sys.stats st
+JOIN 
+    sys.objects o ON st.object_id = o.object_id
+OUTER APPLY 
+    sys.dm_db_stats_properties(st.object_id, st.stats_id) AS sp
+WHERE 
+    o.type = 'U'
+    AND sp.modification_counter IS NOT NULL
+    AND sp.rows > 0
+    AND (CAST(sp.modification_counter AS FLOAT) / sp.rows * 100) >= @ThresholdPercent;
+
+OPEN StatsCursor;
+FETCH NEXT FROM StatsCursor INTO @TableName, @StatsName, @SQL;
+
+WHILE @@FETCH_STATUS = 0
+BEGIN
+    SET @SQL = 'UPDATE STATISTICS ' + @TableName + ' (' + QUOTENAME(@StatsName) + ')';
+    PRINT 'Running: ' + @SQL;
+    EXEC sp_executesql @SQL;
+
+    FETCH NEXT FROM StatsCursor INTO @TableName, @StatsName, @SQL;
+END
+
+CLOSE StatsCursor;
+DEALLOCATE StatsCursor;
+
+---------------------------------------------------------------------------------------------
+/*checks index fragmentation percentage across the selected database, run it under the desired database.
+It will return the fragmentation percentage for each index in each table within the selected database where fragmentation is above a specified threshold (you can adjust that in the first variable).
+It uses LIMITED mode for faster execution (Which is the default in sys.dm_db_index_physical_stats). Change to 'SAMPLED' or 'DETAILED' for more accurate results if needed.
+The script only includes indexes with more than 100 pages to avoid noise from small indexes. You can remove that filter if you want to see all indexes.
+It ignores system databases and heaps (index_id = 0).
+It also provides index size by calculating it from the number of pages (from sys.dm_db_index_physical_stats) and the page size in SQL Server, which is 8 KB per page.
+Notes about size calculations:
+page_count * 8.0 / 1024 gives the index size in MB (since 1 page = 8 KB).
+The DECIMAL(10,2) format ensures it's readable and rounded to 2 decimal places.
+*/
+
+USE [YourDatabaseName]; -- Replace with your database name
+GO
+
+DECLARE @FragmentationThreshold FLOAT = 10.0; -- Set a fragmentation percentage threshold
+
+SELECT 
+    OBJECT_SCHEMA_NAME(ips.object_id) AS SchemaName,
+    OBJECT_NAME(ips.object_id) AS TableName,
+    i.name AS IndexName,
+    i.type_desc AS IndexType,
+    ips.avg_fragmentation_in_percent AS FragmentationPercent,
+    ips.page_count AS PageCount,
+    CAST(ips.page_count * 8.0 / 1024 AS DECIMAL(10,2)) AS IndexSizeMB
+FROM sys.dm_db_index_physical_stats (DB_ID(), NULL, NULL, NULL, 'LIMITED') AS ips
+JOIN sys.indexes AS i
+    ON ips.object_id = i.object_id AND ips.index_id = i.index_id
+WHERE ips.page_count > 100
+  AND ips.avg_fragmentation_in_percent > @FragmentationThreshold
+  AND i.index_id > 0
+ORDER BY ips.avg_fragmentation_in_percent DESC;
+
+-------------------------------------------------------------------------
+
+--Following returns the same result but includes all indexes (No filter with # of pages as above):
+SELECT S.name as 'Schema',
+T.name as 'Table',
+I.name as 'Index',
+DDIPS.avg_fragmentation_in_percent,
+DDIPS.page_count
+FROM sys.dm_db_index_physical_stats (DB_ID(), NULL, NULL, NULL, NULL) AS DDIPS
+INNER JOIN sys.tables T on T.object_id = DDIPS.object_id
+INNER JOIN sys.schemas S on T.schema_id = S.schema_id
+INNER JOIN sys.indexes I ON I.object_id = DDIPS.object_id
+AND DDIPS.index_id = I.index_id
+WHERE DDIPS.database_id = DB_ID()
+and I.name is not null
+AND DDIPS.avg_fragmentation_in_percent > 0
+ORDER BY DDIPS.avg_fragmentation_in_percent desc
+
+---------------------------------------------------------------------------
+--DECLARE @TableName SYSNAME = N'AMES.Products';
+DECLARE @SchemaName SYSNAME = N'dbo';
+
+SELECT 
+    o.name AS TableName,
+    ps.NoOfRows AS NoOfRows,
+    i.name AS IndexName,
+    i.type_desc AS IndexType,
+    CASE WHEN i.is_unique = 1 THEN N'Unique'
+    ELSE N'Not-unique' 
+    END AS IsUnique,
+    STUFF((
+        SELECT ', ' + c.name
+        FROM sys.index_columns ic
+        JOIN sys.columns c 
+            ON ic.object_id = c.object_id 
+           AND ic.column_id = c.column_id
+        WHERE ic.object_id = i.object_id
+          AND ic.index_id = i.index_id
+          AND ic.is_included_column = 0
+        ORDER BY ic.key_ordinal
+        FOR XML PATH(''), TYPE).value('.', 'NVARCHAR(MAX)'), 1, 2, '') AS KeyColumns,
+    STUFF((
+        SELECT ', ' + c.name
+        FROM sys.index_columns ic
+        JOIN sys.columns c 
+            ON ic.object_id = c.object_id 
+           AND ic.column_id = c.column_id
+        WHERE ic.object_id = i.object_id
+          AND ic.index_id = i.index_id
+          AND ic.is_included_column = 1
+        ORDER BY c.column_id
+        FOR XML PATH(''), TYPE).value('.', 'NVARCHAR(MAX)'), 1, 2, '') AS IncludedColumns
+FROM sys.indexes i
+JOIN sys.objects o 
+    ON i.object_id = o.object_id
+    JOIN (
+    SELECT object_id, SUM(row_count) AS NoOfRows
+    FROM sys.dm_db_partition_stats
+    WHERE index_id < 2  -- clustered index or heap, to avoid counting duplicates
+    GROUP BY object_id) AS ps ON o.object_id = ps.object_id
+WHERE o.name IN ('DEL.Products', 'DOE.Products', 'DUMMY.Products')
+  AND SCHEMA_NAME(o.schema_id) = @SchemaName
+  AND i.is_hypothetical = 0
+  AND i.type > 0 -- exclude heaps
+ORDER BY o.name, i.type_desc ASC;
+
+-------------------------------------------------------
+--Selectivity of specific column:
+select count(distinct [ColumnName]) as #unique,
+count(*) as #rows,
+str(count(distinct [ColumnName]) / cast(count(*) as real),6,4) as selectivity 
+from [TableName]
+
+--In results, 1 or close to 1 is highly selective, 0 or close to 0 is low selectivity. 
+--#unqiue is the number of distinct values in the column (a good indicator of selectivity), the more unqiue values, the higher the column selectivity will be.
+
+
+--For more than one 1 column to find selectivity, you can use the following query:
+select count(distinct LastName + FirstName) as '# unique',
+count(*) as '# rows',
+str(count(distinct LastName + FirstName)
+/ cast (count(*) as real),6,4) as 'selectivity'
+from Person.Person
+GO
+
+--Duplicate values skewing column selectivity
+/*One of the questions to ask is whether a few values in the PersonType
+column that have a high number of duplicates are skewing the selectivity or whether
+there are just a few unique values in the table. You can determine this with a query
+similar to the following:*/
+select PersonType,
+count(*) as numrows,
+count(*)/b.totalrows * 100 as percentage
+from Person.Person a,
+(select convert(numeric(8,2), count(*)) as totalrows from Person.Person) as b
+group by PersonType, b.totalrows
+having count(*) > 1
+order by 2 desc
+go
+
+--Percentage shows how much that specific value accounts for percentage of the values in the table.
+
+------------------------------------------------------------------------------------------------------------
+/*To view index usage in a SQL Server database, you can use the dynamic management views sys.dm_db_index_usage_stats along with catalog views like sys.indexes, sys.objects, and sys.schemas.
+
+Here's a T-SQL script that shows index usage statistics for a given database:
+*/
+SELECT 
+    s.name AS SchemaName,
+    o.name AS TableName,
+    i.name AS IndexName,
+    i.type_desc AS IndexType,
+    i.is_primary_key,
+    i.is_unique,
+    i.is_disabled,
+    i.fill_factor,
+    u.user_seeks,
+    u.user_scans,
+    u.user_lookups,
+    u.user_updates,
+    u.last_user_seek,
+    u.last_user_scan,
+    u.last_user_lookup,
+    u.last_user_update
+FROM 
+    sys.indexes AS i
+INNER JOIN 
+    sys.objects AS o ON i.object_id = o.object_id
+INNER JOIN 
+    sys.schemas AS s ON o.schema_id = s.schema_id
+LEFT JOIN 
+    sys.dm_db_index_usage_stats AS u 
+    ON i.object_id = u.object_id AND i.index_id = u.index_id 
+    AND u.database_id = DB_ID()
+WHERE 
+    o.type = 'U'  -- Only user tables
+ORDER BY 
+    s.name, o.name, i.index_id;
+
+/*
+Key Columns Explained:
+user_seeks, user_scans, user_lookups: Show how often the index is used.
+
+user_updates: Number of times the index was updated (e.g., insert/update/delete operations).
+
+last_user_*: Timestamp of last usage.
+
+This view resets when the SQL Server service restarts, so it's most useful for monitoring usage over time between reboots.
+*/
+
+------------------------------------------------------------
+--Same above query but includes index size in MB:
+SELECT 
+    s.name AS SchemaName,
+    o.name AS TableName,
+    i.name AS IndexName,
+    i.type_desc AS IndexType,
+    i.is_disabled,
+    u.user_seeks,
+    u.user_scans,
+    u.user_lookups,
+    u.user_updates,
+    u.last_user_seek,
+    u.last_user_scan,
+    u.last_user_lookup,
+    u.last_user_update,
+    CAST(SUM(ps.used_page_count) * 8.0 / 1024 AS DECIMAL(10,2)) AS IndexSizeMB
+FROM 
+    sys.indexes AS i
+INNER JOIN 
+    sys.objects AS o ON i.object_id = o.object_id
+INNER JOIN 
+    sys.schemas AS s ON o.schema_id = s.schema_id
+LEFT JOIN 
+    sys.dm_db_index_usage_stats AS u 
+    ON i.object_id = u.object_id AND i.index_id = u.index_id 
+    AND u.database_id = DB_ID()
+LEFT JOIN 
+    sys.dm_db_partition_stats AS ps
+    ON i.object_id = ps.object_id AND i.index_id = ps.index_id
+WHERE 
+    o.type = 'U'  -- Only user tables
+GROUP BY 
+    s.name, o.name, i.name, i.type_desc, i.is_disabled,
+    u.user_seeks, u.user_scans, u.user_lookups, u.user_updates,
+    u.last_user_seek, u.last_user_scan, u.last_user_lookup, u.last_user_update
+ORDER BY 
+    IndexSizeMB DESC--, s.name, o.name
+
+-----------------------------------------------------------------
+/*To filter by unused or rarely used indexes, you typically want to focus on:
+
+Non-clustered indexes (i.type_desc = 'NONCLUSTERED')
+
+That have no seeks, scans, or lookups
+
+And possibly high user_updates (they incur cost but no read benefit)
+
+Here's a T-SQL script to find unused or rarely used indexes:
+*/  
+SELECT 
+    s.name AS SchemaName,
+    o.name AS TableName,
+    i.name AS IndexName,
+    i.index_id,
+    i.type_desc AS IndexType,
+    i.is_primary_key,
+    i.is_unique,
+    i.is_disabled,
+    i.fill_factor,
+    ISNULL(u.user_seeks, 0) AS user_seeks,
+    ISNULL(u.user_scans, 0) AS user_scans,
+    ISNULL(u.user_lookups, 0) AS user_lookups,
+    ISNULL(u.user_updates, 0) AS user_updates,
+    u.last_user_seek,
+    u.last_user_scan,
+    u.last_user_lookup,
+    u.last_user_update
+FROM 
+    sys.indexes AS i
+INNER JOIN 
+    sys.objects AS o ON i.object_id = o.object_id
+INNER JOIN 
+    sys.schemas AS s ON o.schema_id = s.schema_id
+LEFT JOIN 
+    sys.dm_db_index_usage_stats AS u 
+    ON i.object_id = u.object_id AND i.index_id = u.index_id 
+    AND u.database_id = DB_ID()
+WHERE 
+    o.type = 'U' -- user tables
+    AND i.type_desc = 'NONCLUSTERED' 
+    AND i.is_primary_key = 0 
+    AND i.is_unique = 0
+    AND ISNULL(u.user_seeks, 0) = 0
+    AND ISNULL(u.user_scans, 0) = 0
+    AND ISNULL(u.user_lookups, 0) = 0
+ORDER BY 
+    user_updates DESC;
+
+/*
+What this script does:
+Finds nonclustered indexes on user tables
+
+Filters out primary keys and unique constraints (since those are usually critical)
+
+Returns indexes with no read activity
+
+Orders by user_updates - high values may indicate costly but unused indexes
+This helps identify candidates for removal or further investigation.
+*/
+
+--------------------------------------------------------------------------------------
+
+/*
+Here's an enhanced version of the T-SQL script that includes estimated space usage of each unused index, allowing you to assess potential savings if the index is dropped:
+We should use used_page_count from sys.dm_db_partition_stats or sys.dm_db_index_physical_stats, or better yet, use sys.allocation_units joined with sys.partitions to get precise space usage.
+*/
+
+;WITH IndexUsage AS (
+    SELECT 
+        i.object_id,
+        i.index_id,
+        s.name AS SchemaName,
+        o.name AS TableName,
+        i.name AS IndexName,
+        i.type_desc AS IndexType,
+        i.is_primary_key,
+        i.is_unique,
+        ISNULL(u.user_seeks, 0) AS user_seeks,
+        ISNULL(u.user_scans, 0) AS user_scans,
+        ISNULL(u.user_lookups, 0) AS user_lookups,
+        ISNULL(u.user_updates, 0) AS user_updates,
+        u.last_user_update
+    FROM 
+        sys.indexes i
+        INNER JOIN sys.objects o ON i.object_id = o.object_id
+        INNER JOIN sys.schemas s ON o.schema_id = s.schema_id
+        LEFT JOIN sys.dm_db_index_usage_stats u 
+            ON u.object_id = i.object_id 
+            AND u.index_id = i.index_id 
+            AND u.database_id = DB_ID()
+    WHERE 
+        o.type = 'U'
+        AND i.type_desc = 'NONCLUSTERED'
+        AND i.is_primary_key = 0
+        AND i.is_unique = 0
+        AND ISNULL(u.user_seeks, 0) = 0
+        AND ISNULL(u.user_scans, 0) = 0
+        AND ISNULL(u.user_lookups, 0) = 0
+),
+IndexSize AS (
+    SELECT 
+        p.object_id,
+        p.index_id,
+        SUM(a.used_pages) * 8.0 / 1024 AS IndexSizeMB
+    FROM 
+        sys.partitions p
+        JOIN sys.allocation_units a ON p.partition_id = a.container_id
+    WHERE 
+        p.index_id > 0
+    GROUP BY 
+        p.object_id, p.index_id
+)
+SELECT 
+    IU.SchemaName,
+    IU.TableName,
+    IU.IndexName,
+    IU.IndexType,
+    IU.user_updates,
+    IU.last_user_update,
+    ISNULL(S.IndexSizeMB, 0) AS IndexSizeMB
+FROM 
+    IndexUsage IU
+    LEFT JOIN IndexSize S ON IU.object_id = S.object_id AND IU.index_id = S.index_id
+ORDER BY 
+    S.IndexSizeMB DESC;
+
+/*
+Output:
+Shows unused nonclustered indexes.
+
+Includes estimated size in MB.
+
+Helps identify high-update, unused, and large indexes worth reviewing/dropping.
+*/
+
+---------------------------
+DECLARE @TableName SYSNAME = N'tblname';
+DECLARE @SchemaName SYSNAME = N'dbo';
+
+SELECT 
+    i.name AS IndexName,
+    i.type_desc AS IndexType,
+    CASE WHEN i.is_unique = 1 THEN N'Unique'
+    ELSE N'Not-unique' 
+    END AS IsUnique,
+    STUFF((
+        SELECT ', ' + c.name
+        FROM sys.index_columns ic
+        JOIN sys.columns c 
+            ON ic.object_id = c.object_id 
+           AND ic.column_id = c.column_id
+        WHERE ic.object_id = i.object_id
+          AND ic.index_id = i.index_id
+          AND ic.is_included_column = 0
+        ORDER BY ic.key_ordinal
+        FOR XML PATH(''), TYPE).value('.', 'NVARCHAR(MAX)'), 1, 2, '') AS KeyColumns,
+    STUFF((
+        SELECT ', ' + c.name
+        FROM sys.index_columns ic
+        JOIN sys.columns c 
+            ON ic.object_id = c.object_id 
+           AND ic.column_id = c.column_id
+        WHERE ic.object_id = i.object_id
+          AND ic.index_id = i.index_id
+          AND ic.is_included_column = 1
+        ORDER BY c.column_id
+        FOR XML PATH(''), TYPE).value('.', 'NVARCHAR(MAX)'), 1, 2, '') AS IncludedColumns
+FROM sys.indexes i
+JOIN sys.objects o 
+    ON i.object_id = o.object_id
+WHERE o.name = @TableName
+  AND SCHEMA_NAME(o.schema_id) = @SchemaName
+  AND i.is_hypothetical = 0
+  AND i.type > 0 -- exclude heaps
+ORDER BY i.type_desc ASC;
+
+-----------------------------------------
+In SQL Server, a Key Lookup (Clustered) operation in an execution plan typically indicates a performance bottleneck—especially when it consumes a large portion of the query cost, like the 94% you're seeing. Let's break this down:
+
+🔍 What is a Key Lookup (Clustered)?
+
+A Key Lookup happens when:
+
+SQL Server uses a NonClustered Index Seek to locate rows based on the indexed column(s),
+
+...but the query needs additional columns that are not included in that nonclustered index,
+
+So, it goes to the Clustered Index (or heap) to fetch those missing columns, for each matching row.
+
+This is row-by-row operation (like a nested loop join), which can be very expensive, especially on large result sets.
+
+
+You said:
+So my table structure is like the following:
+CREATE TABLE Orders (
+    OrderID INT PRIMARY KEY,
+    CustomerID INT,
+    OrderDate DATETIME,
+    TotalAmount MONEY
+);
+And my non-clustered index like this:
+CREATE UNIQUE NONCLUSTERED INDEX [IX_Combined] ON [dbo].[Orders]
+(
+	[CustomerID] ASC,
+	[OrderDate] ASC,
+	[OrderID] ASC
+);
+And my query looks like the following:
+SELECT SUM("TotalAmount") 
+FROM [dbo].[Orders]
+WITH(READUNCOMMITTED)  
+WHERE ("CustomerID"=@0 AND "OrderDate">=@1 AND "OrderDate"<=@2) OPTION(OPTIMIZE FOR UNKNOWN);
+
+So it is retrieving SUM(TotalAmount) column. What the issue here could be and how to fix it?
+You said:
+Yes please. Note that the table has 9127600 rows
+You said:
+I am leaning toward using option 3, but I am not sure if there are other queries that are using the existing index or no. If the existing one is not used by any other query, there is no point in keeping it.
+Is there a way I can find out if there are other queries that are using the existing index?
+You said:
+I checked and I see it has activity, user_seeks = 33285, user_updates=1686 and last_user_seek date is today. This shows the index been used, but how can I confirm if it is being used by my query only or there is another query that is using it?
+
+
+Summary
+Method	Shows Actual Queries	Persistent	Best For
+Query Store	✅ Yes	✅ Yes	Historical usage
+Extended Events	✅ Yes	🚫 No	Real-time monitoring
+Plan Cache Query	✅ Yes (volatile)	🚫 No	Quick one-off check
+
+
+You said:
+I have query store enabled, but I am getting this error when I try to execute option 1 query:
+Cannot call methods on nvarchar(max)
